@@ -9,6 +9,8 @@ from sklearn.preprocessing import MinMaxScaler
 import os
 import joblib
 from io import BytesIO
+import time
+from datetime import timedelta
 
 # ==============================================================================
 # 1. 从您提供的脚本中整合的核心函数 (稍作修改以适应Streamlit)
@@ -58,28 +60,79 @@ def process_data_for_training(df):
     return df, scaler
 
 # --- 机器学习与可视化函数 ---
-def train_and_visualize_model(df, features, target, title):
+def train_and_visualize_model(df, features, target, title, mode='高精度'):
     """
     执行交叉验证，训练最终模型，并生成可视化图表。
+    mode: '快速' 或 '高精度'
     返回: model, scaler, figure, metrics
     """
-    if df is None or df.empty or len(df) < 20:
-        st.warning(f"数据量过少 ({len(df)}个样本)，无法进行可靠的训练，请上传更多数据。")
-        return None, None, None
+    # 数据量检查
+    if df is None or df.empty:
+        st.error("没有数据可供训练，请上传有效的数据文件。")
+        return None, None, None, None
+    
+    # 根据数据量给出建议
+    sample_count = len(df)
+    if sample_count < 10:
+        st.error(f"数据量严重不足 ({sample_count}个样本)，无法进行可靠的训练，请上传至少10个样本。")
+        return None, None, None, None
+    elif sample_count < 20:
+        st.warning(f"数据量较少 ({sample_count}个样本)，模型可能不够稳定，建议上传至少20个样本以获得更可靠的结果。")
+    elif sample_count < 50:
+        st.info(f"当前数据量 ({sample_count}个样本) 基本满足训练需求，但更多的数据会带来更好的模型性能。")
+    else:
+        st.success(f"数据量充足 ({sample_count}个样本)，非常适合进行模型训练！")
 
     X = df[features]
     y = df[target]
     
+    # 根据模式设置参数
+    if mode == '快速':
+        n_splits = 3
+        n_repeats = 2
+        n_estimators = 100
+        grid_resolution = 20
+        st.info("⚡ 快速模式：使用简化参数进行训练，速度更快但精度可能略低。")
+    else:  # 高精度模式
+        n_splits = 5
+        n_repeats = 5
+        n_estimators = 200
+        grid_resolution = 30
+        st.info("🔍 高精度模式：使用完整参数进行训练，精度更高但需要更长时间。")
+    
+    # 创建进度条
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    # 计算总步骤数
+    total_cv_steps = n_splits * n_repeats
+    total_steps = total_cv_steps + 2  # +1为最终模型训练, +1为可视化
+    current_step = 0
+    start_time = time.time()
+    
     # 执行重复K折交叉验证
-    rkf = RepeatedKFold(n_splits=5, n_repeats=5, random_state=42)
+    rkf = RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=42)
     r2_scores, mae_scores = [], []
     model_params = {
-        'objective': 'reg:squarederror', 'n_estimators': 200, 'max_depth': 5,
+        'objective': 'reg:squarederror', 'n_estimators': n_estimators, 'max_depth': 5,
         'learning_rate': 0.1, 'subsample': 0.8, 'colsample_bytree': 0.8,
         'random_state': 42, 'n_jobs': -1
     }
 
-    for train_index, val_index in rkf.split(X, y):
+    for i, (train_index, val_index) in enumerate(rkf.split(X, y)):
+        # 更新进度
+        current_step += 1
+        progress = current_step / total_steps
+        progress_bar.progress(progress)
+        
+        # 计算预计剩余时间
+        elapsed_time = time.time() - start_time
+        estimated_total_time = elapsed_time / progress if progress > 0 else 0
+        remaining_time = estimated_total_time - elapsed_time if estimated_total_time > 0 else 0
+        remaining_time_str = str(timedelta(seconds=int(remaining_time)))
+        
+        status_text.text(f"正在进行交叉验证 ({i+1}/{total_cv_steps})... 预计剩余时间: {remaining_time_str}")
+        
         X_train, X_val = X.iloc[train_index], X.iloc[val_index]
         y_train, y_val = y.iloc[train_index], y.iloc[val_index]
         weights_train = df['sample_weight'].iloc[train_index]
@@ -95,14 +148,25 @@ def train_and_visualize_model(df, features, target, title):
     avg_mae, std_mae = np.mean(mae_scores), np.std(mae_scores)
     metrics = {'r2': avg_r2, 'r2_std': std_r2, 'mae': avg_mae, 'mae_std': std_mae}
 
+    # 更新进度 - 训练最终模型
+    current_step += 1
+    progress = current_step / total_steps
+    progress_bar.progress(progress)
+    status_text.text("正在训练最终模型...")
+    
     # 训练最终模型
     final_model = XGBRegressor(**model_params)
     final_model.fit(X, y, sample_weight=df['sample_weight'])
 
+    # 更新进度 - 生成可视化
+    current_step += 1
+    progress = current_step / total_steps
+    progress_bar.progress(progress)
+    status_text.text("正在生成3D响应面可视化...")
+    
     # 生成3D响应面可视化
     fig = go.Figure()
     weld_statuses = {0: {'name': '无熔接痕', 'color': 'blue'}, 1: {'name': '有熔接痕', 'color': 'red'}}
-    grid_resolution = 30
     
     for status_code, props in weld_statuses.items():
         subset_df = df[df['有无熔接痕(0/1)'] == status_code]
@@ -149,7 +213,12 @@ def train_and_visualize_model(df, features, target, title):
         margin=dict(l=0, r=0, b=0, t=60)
     )
     
-    return final_model, fig, metrics
+    # 完成所有步骤
+    progress_bar.progress(1.0)
+    total_time = time.time() - start_time
+    status_text.text(f"✅ 所有步骤已完成！总耗时: {str(timedelta(seconds=int(total_time)))}")
+    
+    return final_model, fig, metrics, grid_resolution
 
 # ==============================================================================
 # 2. Streamlit 网页应用界面与逻辑
@@ -176,56 +245,126 @@ if app_mode == "训练新模型":
         st.info(
             """
             请上传一个CSV文件，确保包含以下**必需**的列：
-            - `老化温度`: 数值型 (例如: 80, 90.5)
-            - `老化湿度`: 数值型 (例如: 75, 85)
-            - `老化时间`: 数值型 (例如: 24, 48)
-            - `有无熔接痕(0/1)`: 数值型 (0代表无，1代表有)
-            - `拉伸强度` 或 `弯曲强度`: 数值型，作为预测目标。
-            
-            **注意**: 文件中只需包含对应模型类型的强度列即可（例如，训练拉伸强度模型时，文件中必须有`拉伸强度`列）。
             """
         )
+        
+        # 使用表格展示数据格式要求
+        data_format_df = pd.DataFrame({
+            '列名': ['老化温度', '老化湿度', '老化时间', '有无熔接痕(0/1)', f'{model_type}'],
+            '数据类型': ['数值型', '数值型', '数值型', '整数型', '数值型'],
+            '示例值': ['85, 90.5, 95', '75, 80, 85', '24, 48, 72', '0, 1', '120.5, 98.2'],
+            '说明': ['温度值 (°C)', '湿度百分比 (%)', '时间 (小时)', '0=无熔接痕, 1=有熔接痕', '强度值 (根据您选择的模型类型)']  
+        })
+        
+        st.table(data_format_df)
+        
+        st.info(
+            """
+            **注意**: 
+            - 文件中只需包含对应模型类型的强度列即可（例如，训练拉伸强度模型时，文件中必须有`拉伸强度`列）。
+            - 请确保数据中没有缺失值，所有列名必须与上表完全一致。
+            - 建议使用UTF-8编码保存CSV文件，以避免中文乱码问题。
+            """
+        )
+        
+        # 示例数据
+        st.subheader("示例数据预览：")
         st.dataframe(pd.DataFrame({
-            '老化温度': [85, 90], '老化湿度': [75, 80], '老化时间': [24, 48],
-            '有无熔接痕(0/1)': [0, 1], model_type: [120.5, 98.2]
+            '老化温度': [85, 90, 95], '老化湿度': [75, 80, 85], '老化时间': [24, 48, 72],
+            '有无熔接痕(0/1)': [0, 1, 0], model_type: [120.5, 98.2, 115.7]
         }))
 
     uploaded_file = st.file_uploader(f"请上传用于训练 **{model_type}** 模型的数据", type="csv")
 
-    # 2. 训练按钮和执行
+    # 2. 训练模式选择和执行
     if uploaded_file is not None:
-        if st.button(f"🚀 开始训练 {model_type} 模型", use_container_width=True):
-            with st.spinner("正在处理数据并训练模型，请稍候..."):
-                try:
-                    df = pd.read_csv(uploaded_file)
+        st.subheader("步骤 2: 选择训练模式")
+        
+        # 添加训练模式选择
+        training_mode = st.radio(
+            "请选择训练模式：",
+            ["快速", "高精度"],
+            index=1,
+            help="快速模式：训练速度更快，但精度可能略低。高精度模式：训练时间更长，但精度更高。"
+        )
+        
+        # 显示模式说明
+        if training_mode == "快速":
+            st.info("⚡ **快速模式**：使用简化的交叉验证和较少的模型参数，训练速度更快，适合初步探索或数据量较小的情况。")
+            estimated_time = "约1-3分钟"
+        else:
+            st.info("🔍 **高精度模式**：使用完整的交叉验证和更多的模型参数，训练时间更长，但模型精度和稳定性更高。")
+            estimated_time = "约3-10分钟"
+        
+        # 显示数据预览
+        if st.checkbox("预览上传的数据"):
+            try:
+                uploaded_file.seek(0)  # 重置文件指针到文件开头
+                preview_df = pd.read_csv(uploaded_file)
+                st.write(f"数据预览 (共{len(preview_df)}行)：")
+                st.dataframe(preview_df.head(10))
+                
+                # 检查数据列
+                required_cols = ['老化温度', '老化湿度', '老化时间', '有无熔接痕(0/1)', model_type]
+                missing_cols = [col for col in required_cols if col not in preview_df.columns]
+                
+                if missing_cols:
+                    st.warning(f"⚠️ 警告：数据中缺少以下必要列：{', '.join(missing_cols)}")
+                else:
+                    st.success("✅ 数据格式检查通过！所有必要列都已存在。")
                     
-                    # 检查目标列是否存在
-                    if model_type not in df.columns:
-                        st.error(f"上传的文件中缺少目标列 '{model_type}'，请检查文件内容。")
-                    else:
-                        # 数据预处理
+                # 检查数据类型
+                for col in [c for c in required_cols if c in preview_df.columns]:
+                    if not pd.api.types.is_numeric_dtype(preview_df[col]):
+                        st.warning(f"⚠️ 警告：'{col}' 列不是数值类型，这可能会导致训练失败。")
+                
+                # 检查缺失值
+                if preview_df[preview_df.columns.intersection(required_cols)].isnull().any().any():
+                    st.warning("⚠️ 警告：数据中存在缺失值，这可能会影响模型训练效果。")
+                    
+            except Exception as e:
+                st.error(f"预览数据时出错：{e}")
+        
+        # 训练按钮
+        if st.button(f"🚀 开始训练 {model_type} 模型 ({estimated_time})", use_container_width=True):
+            try:
+                # 读取数据
+                uploaded_file.seek(0)  # 重置文件指针到文件开头
+                df = pd.read_csv(uploaded_file)
+                st.info(f"📊 已加载数据：{len(df)}行 x {len(df.columns)}列")
+                
+                # 检查目标列是否存在
+                if model_type not in df.columns:
+                    st.error(f"上传的文件中缺少目标列 '{model_type}'，请检查文件内容。")
+                else:
+                    # 数据预处理
+                    with st.spinner("正在处理数据..."):
                         processed_df, scaler = process_data_for_training(df)
+                    
+                    if processed_df is not None:
+                        # 定义特征和目标
+                        features = ['老化温度_normalized', '老化时间_normalized', '老化湿度_normalized', '有无熔接痕(0/1)']
+                        target = model_type
                         
-                        if processed_df is not None:
-                            # 定义特征和目标
-                            features = ['老化温度_normalized', '老化时间_normalized', '老化湿度_normalized', '有无熔接痕(0/1)']
-                            target = model_type
+                        # 训练并获取结果
+                        model, fig, metrics, grid_resolution = train_and_visualize_model(
+                            processed_df, features, target, model_type, mode=training_mode
+                        )
+                        
+                        if model:
+                            st.success(f"✅ 模型训练完成！使用了{training_mode}模式。")
                             
-                            # 训练并获取结果
-                            model, fig, metrics = train_and_visualize_model(processed_df, features, target, model_type)
-                            
-                            if model:
-                                st.success("模型训练完成！")
-                                
-                                # 保存结果到 session_state 以便后续使用
-                                st.session_state['trained_model'] = model
-                                st.session_state['scaler'] = scaler
-                                st.session_state['figure'] = fig
-                                st.session_state['metrics'] = metrics
-                                st.session_state['model_type'] = model_type
-                                st.session_state['features'] = features
+                            # 保存结果到 session_state 以便后续使用
+                            st.session_state['trained_model'] = model
+                            st.session_state['scaler'] = scaler
+                            st.session_state['figure'] = fig
+                            st.session_state['metrics'] = metrics
+                            st.session_state['model_type'] = model_type
+                            st.session_state['features'] = features
+                            st.session_state['grid_resolution'] = grid_resolution
+                            st.session_state['training_mode'] = training_mode
 
-                except Exception as e:
+            except Exception as e:
                     st.error(f"处理文件或训练模型时发生错误: {e}")
 
     # 3. 展示训练结果
